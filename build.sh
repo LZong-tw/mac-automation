@@ -1,5 +1,5 @@
 #!/bin/bash
-# 編譯 src/*.swift → bin/(編譯產物不進 git)
+# Compile src/*.swift → bin/ (build artifacts are not committed)
 set -euo pipefail
 cd "$(dirname "$0")"
 

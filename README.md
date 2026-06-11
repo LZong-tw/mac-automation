@@ -1,82 +1,107 @@
 # mac-automation
 
-個人 macOS 自動化工具集:shell + Swift 工具與對應的 LaunchAgents。
-換機時跑 `./install.sh` 即可全部還原(編譯 → symlink → bootstrap agents)。
+**English** | [繁體中文](README.zh-TW.md)
 
-## 工具清單
+Personal macOS automation toolkit: shell + Swift utilities with their
+LaunchAgents. On a new machine, `./install.sh` restores everything
+(build → symlink → bootstrap agents).
 
-| 工具 | LaunchAgent | 用途 |
+## Tools
+
+| Tool | LaunchAgent | Purpose |
 |---|---|---|
-| `memory-guardian` | ✓ 每 120s | 記憶體壓力警戒/危急通知,危急時自動停深度閒置的 podman VM |
-| `input-source-restorer` | ✓ 常駐 | 輸入法防亂切換守護程式(Swift,見下方說明) |
-| `input-source-monitor.sh` | ✓ 常駐 | 記錄輸入法切換與當時的前景 app |
-| `input-tap` | — | 輸入事件診斷工具:記錄 Caps Lock 事件與輸入法切換(Swift) |
-| `capslock-monitor` | ✓ 常駐 | 記錄 Caps Lock 狀態變化與前景 app(Swift) |
-| `daily-work-report-reminder` | ✓ | 17:00 工作回報通知 |
-| `kubectl-eks-token` | — | kubectl exec plugin:AWS/Granted 憑證鏈 fallback(ambient → AWS_PROFILE → assume → assume --no-cache) |
+| `memory-guardian` | ✓ every 120s | Memory pressure warning/critical alerts; auto-stops a deep-idle podman VM at critical level |
+| `input-source-restorer` | ✓ daemon | Input source guard — stops macOS from hijacking your IME (Swift, see below) |
+| `input-source-monitor.sh` | ✓ daemon | Logs input source switches with the frontmost app at that moment |
+| `input-tap` | — | Input diagnostics: logs Caps Lock events and input source changes (Swift) |
+| `capslock-monitor` | ✓ daemon | Logs Caps Lock state changes with the frontmost app (Swift) |
+| `daily-work-report-reminder` | ✓ | 17:00 work report notification |
+| `kubectl-eks-token` | — | kubectl exec credential plugin: AWS/Granted fallback chain (ambient → AWS_PROFILE → assume → assume --no-cache) |
 
-## 安裝
+## Install
 
 ```bash
-./install.sh        # build.sh 編譯 Swift 工具,symlink bin/* → ~/.local/bin,複製 plist 並 bootstrap
+./install.sh   # build.sh compiles the Swift tools, symlinks bin/* → ~/.local/bin, copies plists and bootstraps agents
 ```
 
-## input-source-restorer:輸入法防亂切換(v11 policy)
+## input-source-restorer: IME hijack guard (v11 policy)
 
-macOS 會在 secure input(密碼框)或不明原因下把輸入法切到 ABC。這支
-daemon 監聽 TIS 切換通知並自動還原使用者意圖的輸入法:
+macOS sometimes switches the input source to ABC — during secure input
+(password fields) or for no visible reason at all. This daemon watches
+TIS change notifications and restores the input source the user actually
+wants:
 
-- **secure input 白名單**:loginwindow / SecurityAgent / CoreAuthentication.agent
-  持有 secure input 時切到 ABC 屬預期行為,等 `SECURE_OFF` 再還原
-- **MYSTERY_DETECTED**:無 secure 情境卻被切走 → 記下當下高 CPU 程序做鑑識,
-  長期累積 log 就能比對出是哪個背景程式在亂動輸入法
-- **BACKOFF**:連續還原 ≥3 次暫停 5 秒,避免和別的程式打架成無限迴圈
-- **TIS vs TIS_OWN**:事件標籤區分「外部造成的切換」與「自己還原造成的切換」,
-  log 才能拿來鑑識而不是自我污染
+- **Secure-input whitelist**: when loginwindow / SecurityAgent /
+  CoreAuthentication.agent holds secure input, switching to ABC is
+  expected — wait for `SECURE_OFF`, then restore
+- **MYSTERY_DETECTED**: switched away with no secure-input context →
+  capture the top-CPU processes at that instant; over time the log
+  reveals which background process keeps messing with the input source
+- **BACKOFF**: ≥3 consecutive restores pauses 5s, so we never get into
+  an infinite fight with another program
+- **TIS vs TIS_OWN**: event tags distinguish "externally-caused switch"
+  from "switch caused by our own restore" — forensics stays clean
+  instead of polluting itself
 
-### Binary archaeology:這三支 Swift 工具的重生記
+## Binary archaeology: how the Swift tools were resurrected
 
-原始版本的原始碼曾經遺失,只剩 arm64 編譯成品在 `~/.local/bin` 跑了幾個月。
-2026-06 要公開此 repo 時,用三個資訊源把規格反推回來重寫:
+The original sources were lost; only arm64 binaries kept running in
+`~/.local/bin` for months. When publishing this repo (2026-06), the
+specs were reverse-engineered from three sources:
 
-1. `strings` 抽出 log 訊息模板、defaults key、白名單 bundle id、內嵌的 ps 指令
-2. `otool -L` 確認 linked frameworks(Carbon/AppKit/CoreGraphics)
-3. **數月的實際 log** 反推每個事件的觸發條件與輸出格式
+1. `strings` — log message templates, defaults keys, whitelisted bundle
+   ids, an embedded `ps` command
+2. `otool -L` — linked frameworks (Carbon/AppKit/CoreGraphics)
+3. **Months of real logs** — the trigger conditions and exact output
+   format of every event
 
-重寫版與舊版並跑比對行為一致後才替換。教訓:**編譯完就刪原始碼的 binary
-是負債** — 這次花在考古的時間比當初寫它還多。
+The rewrites ran side-by-side with the old binaries until behavior
+matched, then replaced them. Lesson learned: **a binary whose source you
+deleted after compiling is a liability** — the archaeology took longer
+than writing the tools did.
 
-## memory-guardian 背景與設計決策
+## memory-guardian: background and design decisions
 
-2026-06-11 起源:16GB MBP 重度工作負載下,WindowServer 因記憶體壓力死亡
-→ loginwindow 觸發「善後型登出」(`Logout triggered by windowserver exit`)
-→ 整個 GUI session 拆除重建,一天三次。guardian 在壓力到頂前介入。
+Origin (2026-06-11): on a 16GB MacBook Pro under heavy load,
+WindowServer died from memory pressure → loginwindow performed a
+cleanup logout (`Logout triggered by windowserver exit`) → the entire
+GUI session was torn down and rebuilt, three times in one day. The
+guardian intervenes before pressure peaks.
 
-- WARN(free<25% 或 swap>75%):通知,30 分鐘冷卻
-- CRIT(free<15% 或 swap>90%):通知 + 自動停「深度閒置」的 podman VM
-- `SACRIFICE_APPS` 預設留空(刻意:不自動關使用者的 app)
+- WARN (free<25% or swap>75%): notify, 30-min cooldown
+- CRIT (free<15% or swap>90%): notify + auto-stop a *deep-idle* podman VM
+- `SACRIFICE_APPS` defaults to empty (deliberately: never auto-quit the
+  user's apps)
 
-### 深度閒置判定(全部成立才停 VM)
+### Deep-idle determination (ALL must hold before stopping the VM)
 
-1. host 上沒有 podman CLI process(`ps -axo comm=` 比對 binary 名稱)
-2. `podman ps` 查詢**成功且**結果為空,或——
-3. 每個運行中容器:postgres 查 `pg_stat_activity` 最後 client 活動 > 2h,
-   其他容器 CPU < 1%
-4. **任何查詢失敗一律視為非閒置** — 寧可漏判,不可誤殺
+1. No podman CLI process on the host (compared by binary name via
+   `ps -axo comm=`)
+2. `podman ps` succeeds **and** is empty, or —
+3. Every running container: postgres → last client activity in
+   `pg_stat_activity` > 2h; others → CPU < 1%
+4. **Any query failure counts as not-idle** — prefer missing a stop
+   over killing something in use
 
-### 踩過的坑(改這支腳本前必讀)
+### Pitfalls encountered (read before touching this script)
 
-- **launchd 的 PATH 沒有 `/opt/podman/bin`** — 腳本必須自己 export PATH,
-  否則 `command -v podman` 靜默失敗,排程跑起來像沒事一樣
-- **`pgrep -f 'podman exec'` 會誤觸** — 任何 argv 剛好含這字串的無關
-  process(例如測試指令本身)都會 match,要用 `ps -axo comm=` 比對真實 binary
-- **`pg_stat_activity` 要排除自己** — `pid <> pg_backend_pid()`,
-  不然查詢本身就是「最近活動」,永遠判定為使用中
-- 所有靜默路徑都要 log — `2>/dev/null` 吞掉的錯誤會浪費一小時 debug
+- **launchd's PATH has no `/opt/podman/bin`** — the script must export
+  PATH itself, or `command -v podman` fails silently and scheduled runs
+  look like nothing happened
+- **`pgrep -f 'podman exec'` false-positives** — any unrelated process
+  whose argv happens to contain that string (e.g. your own test command)
+  matches; compare real binary names via `ps -axo comm=` instead
+- **`pg_stat_activity` must exclude itself** — `pid <> pg_backend_pid()`,
+  otherwise the probe query itself is "recent activity" and the DB looks
+  busy forever
+- Log every silent path — errors swallowed by `2>/dev/null` cost an hour
+  of debugging each
 
-## kubectl-eks-token 設計
+## kubectl-eks-token design
 
-kubectl exec plugin 的 stdout 必須是純 ExecCredential JSON,任何人類可讀訊息
-洩漏到 stdout 都會讓 kubectl 失敗 — 所以所有 fallback 嘗試都先寫暫存檔驗證
-格式再輸出。憑證來源優先序:已 assume 的 ambient session → AWS_PROFILE →
-Granted assume → assume --no-cache(處理 Granted 偶發的過期快取)。
+A kubectl exec plugin's stdout must be pure ExecCredential JSON — any
+human-readable message leaking into stdout breaks kubectl. So every
+fallback attempt writes to a temp file and validates the format before
+emitting. Credential source priority: already-assumed ambient session →
+AWS_PROFILE → Granted assume → assume --no-cache (handles Granted's
+occasional stale cache).

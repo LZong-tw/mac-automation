@@ -1,5 +1,5 @@
 #!/bin/bash
-# 還原 mac-automation:symlink 腳本 + 安裝並啟動 LaunchAgents(可重複執行)
+# Restore mac-automation: build, symlink scripts, install & start LaunchAgents. Idempotent.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -26,7 +26,7 @@ echo "== install LaunchAgents"
 for plist in "$REPO_DIR"/launchagents/*.plist; do
     name="$(basename "$plist")"
     label="${name%.plist}"
-    # launchd 對 symlink plist 不可靠,一律用複製
+    # launchd is unreliable with symlinked plists — always copy
     cp "$plist" "$AGENT_DIR/$name"
     launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
     launchctl bootstrap "gui/$(id -u)" "$AGENT_DIR/$name"

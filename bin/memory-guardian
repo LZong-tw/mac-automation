@@ -1,20 +1,23 @@
 #!/bin/bash
-# memory-guardian — 防止記憶體壓力高到 WindowServer 被殺(= 整個 session 重建)
-# launchd 環境 PATH 極簡,必須補上 podman 等工具的路徑
-export PATH="/opt/podman/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
-# 由 com.untionglim.memory-guardian LaunchAgent 每 2 分鐘執行一次
+# memory-guardian — keep memory pressure from getting high enough to kill
+# WindowServer (which tears down and rebuilds the entire GUI session).
+# Run by the com.untionglim.memory-guardian LaunchAgent every 2 minutes.
 #
-# WARN  級:通知提醒(30 分鐘冷卻)
-# CRIT  級:通知 + 自動保命動作(AUTO_ACT=1 時):關閒置大戶、停 podman VM
+# WARN  level: notification (30-min cooldown)
+# CRIT  level: notification + automatic actions (when AUTO_ACT=1):
+#              quit sacrificial apps, stop an idle podman VM
+#
+# launchd ships a minimal PATH; podman et al. must be added here.
+export PATH="/opt/podman/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
-WARN_FREE_PCT=25      # free % 低於此 → 警告
-CRIT_FREE_PCT=15      # free % 低於此 → 危急
-WARN_SWAP_PCT=75      # swap 使用率高於此 → 警告
-CRIT_SWAP_PCT=90      # swap 使用率高於此 → 危急
-AUTO_ACT=1            # 1 = 危急時自動關 SACRIFICE_APPS 和 podman VM
-SACRIFICE_APPS=()   # 危急時可被犧牲的常駐 app;留空 = 只通知不關 app(podman 閒置 VM 仍會停)
-DEEP_IDLE_HOURS=2     # 容器層深度閒置:postgres 容器最後 client 活動超過此時數才算閒置
-CPU_IDLE_PCT=1.0      # 非 postgres 容器:CPU 低於此 % 才算閒置
+WARN_FREE_PCT=25      # warn when free % drops below this
+CRIT_FREE_PCT=15      # critical when free % drops below this
+WARN_SWAP_PCT=75      # warn when swap usage % exceeds this
+CRIT_SWAP_PCT=90      # critical when swap usage % exceeds this
+AUTO_ACT=1            # 1 = at CRIT, auto-quit SACRIFICE_APPS and stop podman VM
+SACRIFICE_APPS=()     # apps that may be auto-quit at CRIT; empty = notify only (idle podman VM is still stopped)
+DEEP_IDLE_HOURS=2     # container-level deep idle: postgres counts as idle only after this many hours without client activity
+CPU_IDLE_PCT=1.0      # non-postgres containers: idle only below this CPU %
 COOLDOWN_MIN=30
 
 LOG="$HOME/.local/log/memory-guardian.log"
@@ -35,7 +38,7 @@ level=OK
 
 [ "$level" = OK ] && exit 0
 
-# 通知冷卻(CRIT 不受冷卻限制)
+# Notification cooldown (CRIT is exempt)
 now=$(date +%s); last=$(cat "$STATE" 2>/dev/null || echo 0)
 if [ "$level" = WARN ] && [ $((now - last)) -lt $((COOLDOWN_MIN * 60)) ]; then
     exit 0
@@ -66,10 +69,13 @@ if [ "$AUTO_ACT" = 1 ]; then
     elif ! podman machine list --format '{{.Running}}' 2>/dev/null | grep -q true; then
         log "CRIT skip: podman VM not running"
     else
-        # 閒置 = 同時滿足:
-        #  1) host 上沒有進行中的 podman CLI process(build/pull 期間 ps 看不到容器,不能只靠 ps)
-        #     用 process 名稱比對,避免 pgrep -f 被「指令字串剛好出現在別的程式 argv」誤觸
-        #  2) `podman ps -q` 查詢「成功且為空」— 查詢失敗(VM 異常)一律視為非閒置,絕不誤殺
+        # Idle requires ALL of:
+        #  1) no podman CLI process on the host (during build/pull, `ps`
+        #     shows no containers, so `podman ps` alone is not enough).
+        #     Compare real binary names — `pgrep -f` would false-positive on
+        #     any unrelated process whose argv happens to contain the string.
+        #  2) `podman ps -q` succeeds AND is empty — a failed query (broken
+        #     VM) always counts as not-idle; never kill on bad data.
         if /bin/ps -axo comm= | grep -qE '(^|/)podman$'; then
             log "CRIT skip: podman CLI process running on host"
         else
@@ -77,14 +83,16 @@ if [ "$AUTO_ACT" = 1 ]; then
             if [ "$ps_rc" -ne 0 ]; then
                 log "CRIT skip: podman ps failed (rc=$ps_rc), not assuming idle"
             else
-                # 深度閒置檢查:所有運行中容器都判定閒置,VM 才能停。
-                # 任何檢查失敗 → 視為非閒置(寧可漏判不可誤殺)
+                # Deep-idle check: the VM stops only if EVERY running
+                # container is idle. Any probe failure → not idle
+                # (prefer missing a stop over killing something in use).
                 deep_idle=1
                 for cid in $ps_out; do
                     cname=$(podman inspect --format '{{.Name}}' "$cid" 2>/dev/null)
                     pguser=$(podman inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$cid" 2>/dev/null | awk -F= '/^POSTGRES_USER=/{print $2}')
                     if [ -n "$pguser" ]; then
-                        # postgres:看最後一次 client 活動距今幾秒(排除本查詢自身;無 session = 視為極久)
+                        # postgres: seconds since last client activity,
+                        # excluding this probe itself (no sessions = forever).
                         idle_sec=$(podman exec "$cid" psql -U "$pguser" -At -c \
                             "select coalesce(extract(epoch from now() - max(state_change))::bigint, 999999999) \
                              from pg_stat_activity \
@@ -95,7 +103,7 @@ if [ "$AUTO_ACT" = 1 ]; then
                             break
                         fi
                     else
-                        # 其他容器:單次取樣 CPU,低於閾值才算閒置
+                        # other containers: single CPU sample below threshold
                         cpu=$(podman stats --no-stream --format '{{.CPUPerc}}' "$cid" 2>/dev/null | tr -d '%')
                         if [ -z "$cpu" ] || awk "BEGIN{exit !($cpu >= $CPU_IDLE_PCT)}"; then
                             deep_idle=0

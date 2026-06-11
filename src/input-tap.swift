@@ -1,9 +1,11 @@
-// input-tap — 輸入事件診斷工具:記錄 Caps Lock 按鍵事件與輸入法切換
-// 原始版本原始碼遺失;本檔依 binary strings 與 log 格式重建,行為等價。
-// log 格式:
+// input-tap — input diagnostics: log Caps Lock key events and input
+// source changes.
+// The original source was lost; this file is a behavior-equivalent rebuild
+// from binary strings and the observed log format.
+// Log format:
 //   `2026-04-10 15:42:41.184 [loginwindow] INPUT_SOURCE_CHANGED to=ABC`
 //   `... FLAGS capslock=ON keycode=57`
-// 需要輔助使用權限(Accessibility)才能建立 event tap。
+// Creating the event tap requires Accessibility permission.
 import AppKit
 import Carbon
 import CoreGraphics
@@ -33,7 +35,7 @@ func currentInputSourceName() -> String {
     return Unmanaged<CFString>.fromOpaque(ptr).takeUnretainedValue() as String
 }
 
-// 輸入法切換通知
+// Input source change notifications
 DistributedNotificationCenter.default().addObserver(
     forName: NSNotification.Name("com.apple.Carbon.TISNotifySelectedKeyboardInputSourceChanged"),
     object: nil, queue: .main
@@ -41,7 +43,7 @@ DistributedNotificationCenter.default().addObserver(
     appendLog("\(fmt.string(from: Date())) [\(frontApp())] INPUT_SOURCE_CHANGED to=\(currentInputSourceName())")
 }
 
-// Caps Lock 按鍵事件(flagsChanged)
+// Caps Lock key events (flagsChanged)
 let mask = CGEventMask(1 << CGEventType.flagsChanged.rawValue)
 guard let tap = CGEvent.tapCreate(
     tap: .cgSessionEventTap, place: .headInsertEventTap, options: .listenOnly,

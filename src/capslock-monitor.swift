@@ -1,6 +1,7 @@
-// capslock-monitor — 記錄 Caps Lock 狀態變化與當時的前景 app
-// 原始版本原始碼遺失;本檔依 binary strings 與 log 格式重建,行為等價。
-// log 格式:`2026-06-11 13:48:53 [iTerm2] caps_lock=ON`
+// capslock-monitor — log Caps Lock state changes with the frontmost app.
+// The original source was lost; this file is a behavior-equivalent rebuild
+// from binary strings and the observed log format.
+// Log format: `2026-06-11 13:48:53 [iTerm2] caps_lock=ON`
 import AppKit
 import CoreGraphics
 

@@ -1,16 +1,22 @@
-// input-source-restorer v11 — 輸入法防亂切換守護程式
+// input-source-restorer v11 — input source hijack guard daemon
 //
-// 問題:macOS 會在 secure input(密碼框)或不明原因下把輸入法切到 ABC,
-// 使用者(Squirrel 鼠鬚管)需要每次手動切回。本工具自動偵測並還原。
+// Problem: macOS switches the input source to ABC during secure input
+// (password fields) or for no visible reason, forcing the user (on the
+// Squirrel IME) to switch back by hand every time. This daemon detects
+// the hijack and restores automatically.
 //
-// 原始版本原始碼遺失;本檔依 binary strings 與既有 log 行為重建
-// (secure owner context policy,與原 v11 行為等價):
-//   - 追蹤使用者「真正想用」的輸入法(tracked)
-//   - secure input 由白名單程序(loginwindow / SecurityAgent /
-//     CoreAuthentication.agent)持有時:屬預期行為,等 SECURE_OFF 後還原
-//   - 無 secure 情境卻被切到 ABC:MYSTERY_DETECTED,記下當下高 CPU 程序
-//     做鑑識(供事後比對是哪個背景程式在亂動輸入法),並 ENFORCE 還原
-//   - 連續還原 >= 3 次:BACKOFF 暫停 5 秒,避免和其他程式打架成迴圈
+// The original source was lost; this file is a behavior-equivalent
+// rebuild from binary strings and months of observed logs
+// (the "secure owner context policy" of v11):
+//   - track the input source the user actually wants (tracked)
+//   - secure input held by a whitelisted process (loginwindow /
+//     SecurityAgent / CoreAuthentication.agent): expected behavior,
+//     restore after SECURE_OFF
+//   - switched to ABC with no secure context: MYSTERY_DETECTED — capture
+//     the top-CPU processes for forensics (to identify which background
+//     process keeps touching the input source), then ENFORCE a restore
+//   - >= 3 consecutive restores: BACKOFF 5s, never fight another
+//     program in an infinite loop
 import AppKit
 import Carbon
 
@@ -54,7 +60,7 @@ func appContext(_ app: NSRunningApplication?) -> String {
 
 func frontmostContext() -> String { appContext(NSWorkspace.shared.frontmostApplication) }
 
-// secure input 擁有者:從 CGSession dictionary 的 kCGSSessionSecureInputPID 取得
+// Secure input owner: kCGSSessionSecureInputPID from the CGSession dictionary
 func secureInputOwner() -> NSRunningApplication? {
     guard let dict = CGSessionCopyCurrentDictionary() as? [String: Any],
           let pid = dict["kCGSSessionSecureInputPID"] as? Int32 else { return nil }
@@ -93,8 +99,8 @@ func selectSource(id: String) -> Bool {
     return true
 }
 
-// ---- 狀態 ----
-var tracked = currentSourceID()          // 使用者意圖的輸入法
+// ---- State ----
+var tracked = currentSourceID()          // the input source the user intends to use
 var lastTISEvent = Date()
 var lastSecure = IsSecureEventInputEnabled()
 var consecutiveRestores = 0
@@ -109,9 +115,10 @@ func restore(reason: String) {
     guard Date() >= backoffUntil else { return }
     consecutiveRestores += 1
     appendLog("ENFORCE \(frontmostContext()) secure=\(secureFlag()) Δt=\(deltaT())s | restoring \(tracked) (consec=\(consecutiveRestores))")
-    // TISSelectInputSource 成功後,TISCopyCurrentKeyboardInputSource 的回讀有
-    // 非同步延遲 — 信任 noErr 即視為成功,別立即回讀驗證(會誤報失敗)。
-    // 若實際沒切成功,下一個 TIS 變更通知會再次觸發 ENFORCE 自我修正。
+    // After TISSelectInputSource succeeds, TISCopyCurrentKeyboardInputSource
+    // lags asynchronously — trust noErr as success instead of reading back
+    // immediately (which falsely reports failure). If the switch did not
+    // stick, the next TIS change notification re-triggers ENFORCE.
     for attempt in 1...maxRestoreAttempts {
         if selectSource(id: tracked) {
             appendLog("RESTORED \(tracked) attempt=\(attempt)")
@@ -129,39 +136,39 @@ func restore(reason: String) {
     }
 }
 
-// ---- TIS 切換事件 ----
+// ---- TIS change events ----
 var prevSource = tracked
 DistributedNotificationCenter.default().addObserver(
     forName: NSNotification.Name("com.apple.Carbon.TISNotifySelectedKeyboardInputSourceChanged"),
     object: nil, queue: .main
 ) { _ in
     let now = currentSourceID()
-    // TIS_OWN = 這次切換是自己的還原動作造成的(restore 後 1 秒內回到 tracked)
+    // TIS_OWN = this change was caused by our own restore (back to tracked within 1s)
     let selfCaused = now == tracked && Date().timeIntervalSince(lastRestoreAt) < 1.0
     appendLog("\(selfCaused ? "TIS_OWN" : "TIS") \(frontmostContext()) secure=\(secureFlag()) Δt=\(deltaT())s, prev=\(prevSource) | → \(now)")
     lastTISEvent = Date()
     defer { prevSource = now }
     guard now != tracked else {
-        consecutiveRestores = max(0, consecutiveRestores)  // 回到正軌,讓 backoff 視窗自然過期
+        consecutiveRestores = max(0, consecutiveRestores)  // back on track; let the backoff window expire naturally
         return
     }
     if now == abcID {
         let owner = secureInputOwner()
         let ownerWhitelisted = owner?.bundleIdentifier.map { secureOwnerWhitelist.contains($0) } ?? false
         if IsSecureEventInputEnabled() && ownerWhitelisted {
-            // 密碼框情境:預期行為,等 SECURE_OFF 再還原
+            // password-field context: expected, restore after SECURE_OFF
             return
         }
         appendLog("MYSTERY_DETECTED procs=[\(topProcs())]")
         restore(reason: "mystery-abc")
     } else {
-        // 使用者主動切到別的輸入法:更新意圖
+        // the user deliberately switched: update intent
         tracked = now
         consecutiveRestores = 0
     }
 }
 
-// ---- secure input 狀態輪詢(SECURE_ON / SECURE_OFF 邊緣偵測)----
+// ---- Secure input polling (SECURE_ON / SECURE_OFF edge detection) ----
 Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { _ in
     let secure = IsSecureEventInputEnabled()
     guard secure != lastSecure else { return }
@@ -177,7 +184,7 @@ Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { _ in
     }
 }
 
-// ---- App 切換脈絡(APP_FOCUS)----
+// ---- App activation context (APP_FOCUS) ----
 NSWorkspace.shared.notificationCenter.addObserver(
     forName: NSWorkspace.didActivateApplicationNotification,
     object: nil, queue: .main
