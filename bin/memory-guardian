@@ -1,0 +1,120 @@
+#!/bin/bash
+# memory-guardian — 防止記憶體壓力高到 WindowServer 被殺(= 整個 session 重建)
+# launchd 環境 PATH 極簡,必須補上 podman 等工具的路徑
+export PATH="/opt/podman/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+# 由 com.untionglim.memory-guardian LaunchAgent 每 2 分鐘執行一次
+#
+# WARN  級:通知提醒(30 分鐘冷卻)
+# CRIT  級:通知 + 自動保命動作(AUTO_ACT=1 時):關閒置大戶、停 podman VM
+
+WARN_FREE_PCT=25      # free % 低於此 → 警告
+CRIT_FREE_PCT=15      # free % 低於此 → 危急
+WARN_SWAP_PCT=75      # swap 使用率高於此 → 警告
+CRIT_SWAP_PCT=90      # swap 使用率高於此 → 危急
+AUTO_ACT=1            # 1 = 危急時自動關 SACRIFICE_APPS 和 podman VM
+SACRIFICE_APPS=()   # 危急時可被犧牲的常駐 app;留空 = 只通知不關 app(podman 閒置 VM 仍會停)
+DEEP_IDLE_HOURS=2     # 容器層深度閒置:postgres 容器最後 client 活動超過此時數才算閒置
+CPU_IDLE_PCT=1.0      # 非 postgres 容器:CPU 低於此 % 才算閒置
+COOLDOWN_MIN=30
+
+LOG="$HOME/.local/log/memory-guardian.log"
+STATE="$HOME/.local/log/.memory-guardian-laststamp"
+
+free_pct=$(memory_pressure -Q | awk -F': ' '/free percentage/ {gsub(/%/,"",$2); print int($2)}')
+read -r swap_total swap_used <<<"$(sysctl -n vm.swapusage | awk '{gsub(/M$/,"",$3); gsub(/M$/,"",$6); print $3, $6}')"
+swap_pct=0
+[ -n "$swap_total" ] && [ "${swap_total%.*}" -gt 0 ] && swap_pct=$(awk "BEGIN{printf \"%d\", $swap_used*100/$swap_total}")
+
+ts() { date "+%F %T"; }
+log() { echo "$(ts) $*" >> "$LOG"; }
+notify() { osascript -e "display notification \"$2\" with title \"$1\" sound name \"Sosumi\"" 2>/dev/null; }
+
+level=OK
+{ [ "$free_pct" -lt "$CRIT_FREE_PCT" ] || [ "$swap_pct" -gt "$CRIT_SWAP_PCT" ]; } && level=CRIT
+[ "$level" = OK ] && { [ "$free_pct" -lt "$WARN_FREE_PCT" ] || [ "$swap_pct" -gt "$WARN_SWAP_PCT" ]; } && level=WARN
+
+[ "$level" = OK ] && exit 0
+
+# 通知冷卻(CRIT 不受冷卻限制)
+now=$(date +%s); last=$(cat "$STATE" 2>/dev/null || echo 0)
+if [ "$level" = WARN ] && [ $((now - last)) -lt $((COOLDOWN_MIN * 60)) ]; then
+    exit 0
+fi
+echo "$now" > "$STATE"
+
+top3=$(/bin/ps -axo rss=,comm= | awk '{n=split($2,p,"/"); rss[p[n]]+=$1} END {for(c in rss) printf "%.1fG %s\n", rss[c]/1048576, c}' | sort -rn | head -3 | tr '\n' ' ')
+log "$level free=${free_pct}% swap=${swap_pct}% top: $top3"
+
+if [ "$level" = WARN ]; then
+    notify "記憶體壓力警告" "free ${free_pct}% / swap ${swap_pct}%。建議關閒置 app。Top: $top3"
+    exit 0
+fi
+
+# CRIT
+notify "記憶體危急!" "free ${free_pct}% / swap ${swap_pct}%,再不處理 session 可能整個重建"
+if [ "$AUTO_ACT" = 1 ]; then
+    acted=""
+    for app in "${SACRIFICE_APPS[@]}"; do
+        if pgrep -qf "$app.app"; then
+            osascript -e "tell application \"$app\" to quit" 2>/dev/null
+            log "CRIT action: quit $app"
+            acted="$acted $app"
+        fi
+    done
+    if ! command -v podman >/dev/null; then
+        log "CRIT skip: podman not in PATH"
+    elif ! podman machine list --format '{{.Running}}' 2>/dev/null | grep -q true; then
+        log "CRIT skip: podman VM not running"
+    else
+        # 閒置 = 同時滿足:
+        #  1) host 上沒有進行中的 podman CLI process(build/pull 期間 ps 看不到容器,不能只靠 ps)
+        #     用 process 名稱比對,避免 pgrep -f 被「指令字串剛好出現在別的程式 argv」誤觸
+        #  2) `podman ps -q` 查詢「成功且為空」— 查詢失敗(VM 異常)一律視為非閒置,絕不誤殺
+        if /bin/ps -axo comm= | grep -qE '(^|/)podman$'; then
+            log "CRIT skip: podman CLI process running on host"
+        else
+            ps_out=$(podman ps -q 2>/dev/null); ps_rc=$?
+            if [ "$ps_rc" -ne 0 ]; then
+                log "CRIT skip: podman ps failed (rc=$ps_rc), not assuming idle"
+            else
+                # 深度閒置檢查:所有運行中容器都判定閒置,VM 才能停。
+                # 任何檢查失敗 → 視為非閒置(寧可漏判不可誤殺)
+                deep_idle=1
+                for cid in $ps_out; do
+                    cname=$(podman inspect --format '{{.Name}}' "$cid" 2>/dev/null)
+                    pguser=$(podman inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$cid" 2>/dev/null | awk -F= '/^POSTGRES_USER=/{print $2}')
+                    if [ -n "$pguser" ]; then
+                        # postgres:看最後一次 client 活動距今幾秒(排除本查詢自身;無 session = 視為極久)
+                        idle_sec=$(podman exec "$cid" psql -U "$pguser" -At -c \
+                            "select coalesce(extract(epoch from now() - max(state_change))::bigint, 999999999) \
+                             from pg_stat_activity \
+                             where backend_type='client backend' and pid <> pg_backend_pid();" 2>/dev/null)
+                        if ! [[ "$idle_sec" =~ ^[0-9]+$ ]] || [ "$idle_sec" -lt $((DEEP_IDLE_HOURS * 3600)) ]; then
+                            deep_idle=0
+                            log "CRIT skip: $cname last pg activity ${idle_sec:-query-failed}s ago (< ${DEEP_IDLE_HOURS}h)"
+                            break
+                        fi
+                    else
+                        # 其他容器:單次取樣 CPU,低於閾值才算閒置
+                        cpu=$(podman stats --no-stream --format '{{.CPUPerc}}' "$cid" 2>/dev/null | tr -d '%')
+                        if [ -z "$cpu" ] || awk "BEGIN{exit !($cpu >= $CPU_IDLE_PCT)}"; then
+                            deep_idle=0
+                            log "CRIT skip: $cname CPU ${cpu:-unknown}% (>= ${CPU_IDLE_PCT}%)"
+                            break
+                        fi
+                    fi
+                done
+                if [ "$deep_idle" = 1 ]; then
+                    if podman machine stop 2>>"$LOG"; then
+                        log "CRIT action: podman machine stop (all containers deep-idle)"
+                        acted="$acted podman-VM"
+                    else
+                        log "CRIT: podman machine stop FAILED (rc=$?)"
+                    fi
+                fi
+            fi
+        fi
+    fi
+    [ -n "$acted" ] && notify "已自動處理" "關閉:$acted"
+fi
+exit 0

@@ -1,0 +1,4 @@
+#!/bin/zsh
+
+/bin/date "+%Y-%m-%d %H:%M:%S daily work report reminder fired"
+/usr/bin/osascript -e 'display notification "請回報今天的工作進度。" with title "每日工作回報" subtitle "17:00 提醒" sound name "Glass"'

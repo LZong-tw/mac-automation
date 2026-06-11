@@ -1,0 +1,8 @@
+*.log
+*.bak
+*.old
+.DS_Store
+# built artifacts (from src/ via build.sh)
+/bin/capslock-monitor
+/bin/input-tap
+/bin/input-source-restorer

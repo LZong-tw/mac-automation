@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+AWS_BIN="${AWS_BIN:-aws}"
+ASSUME_SHELL="${ASSUME_SHELL:-/bin/zsh}"
+PROFILE=""
+AWS_ARGS=()
+TMP_DIR="${TMPDIR:-/tmp}"
+STDOUT_FILE="$(mktemp "$TMP_DIR/kubectl-eks-token.stdout.XXXXXX")"
+STDERR_FILE="$(mktemp "$TMP_DIR/kubectl-eks-token.stderr.XXXXXX")"
+LAST_STDOUT_FILE="$(mktemp "$TMP_DIR/kubectl-eks-token.last-stdout.XXXXXX")"
+LAST_STDERR_FILE="$(mktemp "$TMP_DIR/kubectl-eks-token.last-stderr.XXXXXX")"
+
+cleanup() {
+  rm -f "$STDOUT_FILE" "$STDERR_FILE" "$LAST_STDOUT_FILE" "$LAST_STDERR_FILE"
+}
+trap cleanup EXIT
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --profile)
+      if [[ $# -lt 2 ]]; then
+        echo "kubectl-eks-token: --profile requires a value" >&2
+        exit 2
+      fi
+      PROFILE="$2"
+      shift 2
+      ;;
+    --)
+      shift
+      AWS_ARGS+=("$@")
+      break
+      ;;
+    *)
+      AWS_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ ${#AWS_ARGS[@]} -eq 0 ]]; then
+  echo "kubectl-eks-token: expected AWS CLI args, for example: --profile my-profile --region ap-northeast-1 eks get-token --cluster-name my-cluster --output json" >&2
+  exit 2
+fi
+
+run_profile_aws() {
+  if [[ -n "$PROFILE" ]]; then
+    env \
+      -u AWS_ACCESS_KEY_ID \
+      -u AWS_SECRET_ACCESS_KEY \
+      -u AWS_SESSION_TOKEN \
+      -u AWS_SECURITY_TOKEN \
+      AWS_PROFILE="$PROFILE" \
+      "$AWS_BIN" "${AWS_ARGS[@]}"
+  else
+    "$AWS_BIN" "${AWS_ARGS[@]}"
+  fi
+}
+
+ambient_profile_matches() {
+  [[ -n "$PROFILE" ]] || return 1
+  [[ -n "${AWS_ACCESS_KEY_ID:-}" ]] || return 1
+
+  [[ "${AWS_PROFILE:-}" == "$PROFILE" ]] && return 0
+  [[ "${AWS_DEFAULT_PROFILE:-}" == "$PROFILE" ]] && return 0
+  [[ "${AWS_VAULT:-}" == "$PROFILE" ]] && return 0
+  [[ "${GRANTED_AWS_PROFILE:-}" == "$PROFILE" ]] && return 0
+  [[ "${GRANTED_ALIAS_CONFIGURED:-}" == "$PROFILE" ]] && return 0
+
+  return 1
+}
+
+run_ambient_aws() {
+  ambient_profile_matches || return 1
+  "$AWS_BIN" "${AWS_ARGS[@]}"
+}
+
+remember_attempt() {
+  cp "$STDOUT_FILE" "$LAST_STDOUT_FILE" 2>/dev/null || true
+  cp "$STDERR_FILE" "$LAST_STDERR_FILE" 2>/dev/null || true
+}
+
+is_valid_exec_credential() {
+  [[ -s "$1" ]] || return 1
+  grep -Eq '"kind"[[:space:]]*:[[:space:]]*"ExecCredential"' "$1" || return 1
+  grep -Eq '"apiVersion"[[:space:]]*:[[:space:]]*"client\.authentication\.k8s\.io/v1(beta1)?"' "$1" || return 1
+  ! grep -q 'client.authentication.k8s.io/__internal' "$1"
+}
+
+emit_success() {
+  if [[ -s "$STDERR_FILE" ]]; then
+    cat "$STDERR_FILE" >&2
+  fi
+  cat "$STDOUT_FILE"
+  exit 0
+}
+
+emit_failure() {
+  local label="$1"
+  echo "kubectl-eks-token: $label" >&2
+  if [[ -s "$LAST_STDERR_FILE" ]]; then
+    cat "$LAST_STDERR_FILE" >&2
+  fi
+  if [[ -s "$LAST_STDOUT_FILE" ]]; then
+    echo "kubectl-eks-token: command wrote non-ExecCredential stdout; forwarding it to stderr for diagnostics" >&2
+    cat "$LAST_STDOUT_FILE" >&2
+  fi
+  exit 1
+}
+
+if [[ -z "$PROFILE" ]]; then
+  if run_profile_aws >"$STDOUT_FILE" 2>"$STDERR_FILE" && is_valid_exec_credential "$STDOUT_FILE"; then
+    emit_success
+  fi
+  remember_attempt
+  emit_failure "AWS CLI did not return a valid ExecCredential"
+fi
+
+if [[ ! -x "$ASSUME_SHELL" ]]; then
+  echo "kubectl-eks-token: assume shell not found or not executable: $ASSUME_SHELL" >&2
+  exit 127
+fi
+
+build_assume_command() {
+  local no_cache="$1"
+  local assume_command="$AWS_BIN"
+  local quoted_arg quoted_command quoted_profile
+
+  for arg in "${AWS_ARGS[@]}"; do
+    printf -v quoted_arg '%q' "$arg"
+    assume_command+=" $quoted_arg"
+  done
+
+  printf -v quoted_command '%q' "$assume_command"
+  printf -v quoted_profile '%q' "$PROFILE"
+
+  if [[ "$no_cache" == "1" ]]; then
+    printf 'assume --no-cache --exec %s %s' "$quoted_command" "$quoted_profile"
+  else
+    printf 'assume --exec %s %s' "$quoted_command" "$quoted_profile"
+  fi
+}
+
+run_assume() {
+  local no_cache="$1"
+  local assume_shell_command
+  assume_shell_command="$(build_assume_command "$no_cache")"
+  if [[ -t 2 ]]; then
+    "$ASSUME_SHELL" -lc "$assume_shell_command" >"$STDOUT_FILE" 2> >(tee "$STDERR_FILE" >&2)
+  else
+    "$ASSUME_SHELL" -lc "$assume_shell_command" >"$STDOUT_FILE" 2>"$STDERR_FILE"
+  fi
+}
+
+# Prefer a matching already-assumed shell (Granted/aws-vault). This keeps
+# `assume my-profile && kubectl ...` deterministic without re-prompting from
+# inside the Kubernetes exec plugin. If no matching ambient session exists, try
+# plain AWS_PROFILE; if that path has no usable cached credentials, fall back to
+# Granted. Keep stdout strictly JSON because kubectl exec plugins fail if
+# human-readable refresh messages leak into stdout.
+if ambient_profile_matches; then
+  if run_ambient_aws >"$STDOUT_FILE" 2>"$STDERR_FILE" && is_valid_exec_credential "$STDOUT_FILE"; then
+    emit_success
+  fi
+  remember_attempt
+fi
+
+if run_profile_aws >"$STDOUT_FILE" 2>"$STDERR_FILE" && is_valid_exec_credential "$STDOUT_FILE"; then
+  emit_success
+fi
+remember_attempt
+
+if run_assume 0 && is_valid_exec_credential "$STDOUT_FILE"; then
+  emit_success
+fi
+remember_attempt
+
+# Granted can occasionally keep a stale cache entry that reports a refreshed
+# but already-expired session. Force one no-cache refresh before failing.
+if run_assume 1 && is_valid_exec_credential "$STDOUT_FILE"; then
+  emit_success
+fi
+remember_attempt
+
+emit_failure "assume/aws did not return a valid ExecCredential after cache refresh"
